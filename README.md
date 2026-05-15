@@ -35,7 +35,7 @@ It is intended for research, interoperability testing, and technical analysis of
 
 ## Requirements
 
-* Python 3.9 or higher
+* Python 3.10 or higher
 * `pycryptodome`
 * `construct==2.8.8`
 * `lxml`
