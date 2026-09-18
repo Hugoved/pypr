@@ -1,22 +1,505 @@
 from __future__ import annotations
+
 import argparse
 import base64
 import binascii
+import collections.abc
+import copy
+import hashlib
+import html
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import struct
+import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Iterator, List, Optional, Tuple, Union
 from uuid import UUID
 
-__version__ = "1.9.0"
+import click
+import requests
+from Crypto.Cipher import AES
+from Crypto.Hash import CMAC, SHA256
+from Crypto.Hash.SHA256 import SHA256Hash
+from Crypto.PublicKey import ECC
+from Crypto.PublicKey.ECC import EccKey
+from Crypto.Random import get_random_bytes
+from Crypto.Signature import DSS
+from Crypto.Util.Padding import pad
+from Crypto.Util.strxor import strxor
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.keywrap import aes_key_unwrap
+from ecpy import curve_defs
+from ecpy.curve_defs import WEIERSTRASS
+from ecpy.curves import Curve, Point
+from ecpy.ecdsa import ECDSA
+from ecpy.keys import ECPublicKey
+
+__version__ = "0.8.4"
+
+class BinaryFormatError(Exception):
+    pass
+
+class Container(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+    def __setattr__(self, name, value):
+        self[name] = value
+
+class ListContainer(list):
+    pass
+
+class _Context(Container):
+    def __init__(self, *args, _parent=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "_parent_ctx", _parent)
+    def __getattr__(self, name):
+        if name == "_":
+            return object.__getattribute__(self, "_parent_ctx")
+        return super().__getattr__(name)
+
+class _Expr:
+    def __init__(self, fn):
+        self.fn = fn
+    def __call__(self, ctx):
+        return self.fn(ctx)
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return _Expr(lambda ctx, self=self, name=name: getattr(self(ctx), name))
+    def _bin(self, other, op):
+        return _Expr(lambda ctx, self=self, other=other, op=op: op(self(ctx), _eval(other, ctx)))
+    def __add__(self, other):
+        return self._bin(other, lambda a,b: a+b)
+    def __radd__(self, other):
+        return _Expr(lambda ctx, self=self, other=other: _eval(other, ctx)+self(ctx))
+    def __sub__(self, other):
+        return self._bin(other, lambda a,b: a-b)
+    def __rsub__(self, other):
+        return _Expr(lambda ctx, self=self, other=other: _eval(other, ctx)-self(ctx))
+    def __mul__(self, other):
+        return self._bin(other, lambda a,b: a*b)
+    def __floordiv__(self, other):
+        return self._bin(other, lambda a,b: a//b)
+    def __and__(self, other):
+        return self._bin(other, lambda a,b: a & b)
+    def __mod__(self, other):
+        return self._bin(other, lambda a,b: a % b)
+    def __rmod__(self, other):
+        return _Expr(lambda ctx, self=self, other=other: _eval(other, ctx) % self(ctx))
+    def __eq__(self, other):
+        return self._bin(other, lambda a,b: a == b)
+    def __ne__(self, other):
+        return self._bin(other, lambda a,b: a != b)
+
+class _This:
+    def __getattr__(self, name):
+        if name == "_":
+            return _Expr(lambda ctx: ctx._)
+        return _Expr(lambda ctx, name=name: getattr(ctx, name))
+
+this = _This()
+
+def _eval(value, ctx):
+    if isinstance(value, _Expr):
+        return value(ctx)
+    if callable(value) and not isinstance(value, _Field):
+        return value(ctx)
+    return value
+
+class _Field:
+    def __rtruediv__(self, name):
+        return _NamedField(str(name), self)
+    def parse(self, data):
+        raw = bytes(data)
+        value, offset = self._parse(raw, 0, _Context(), len(raw))
+        return value
+    def build(self, obj=None):
+        ctx = _Context()
+        return self._build(obj, ctx)
+
+class _NamedField(_Field):
+    def __init__(self, name, subcon):
+        self.name = name
+        self.subcon = _coerce(subcon)
+    def _parse(self, data, offset, ctx, end):
+        return self.subcon._parse(data, offset, ctx, end)
+    def _build(self, obj, ctx):
+        return self.subcon._build(obj, ctx)
+    def build(self, obj=None):
+        return self.subcon.build(obj)
+
+class _IntField(_Field):
+    def __init__(self, size, endian="big"):
+        self.size = size
+        self.endian = endian
+    def _parse(self, data, offset, ctx, end):
+        if offset + self.size > end:
+            raise BinaryFormatError("Unexpected end of data")
+        return int.from_bytes(data[offset:offset+self.size], self.endian), offset+self.size
+    def _build(self, obj, ctx):
+        if obj is None:
+            raise BinaryFormatError("Missing integer value")
+        try:
+            value = int(obj)
+        except Exception as exc:
+            raise BinaryFormatError(f"Invalid integer value: {obj!r}") from exc
+        return value.to_bytes(self.size, self.endian, signed=False)
+
+Int8ub = _IntField(1, "big")
+Int16ub = _IntField(2, "big")
+Int24ub = _IntField(3, "big")
+Int32ub = _IntField(4, "big")
+Int64ub = _IntField(8, "big")
+Int16ul = _IntField(2, "little")
+Int32ul = _IntField(4, "little")
+Int64ul = _IntField(8, "little")
+
+class _BytesField(_Field):
+    def __init__(self, length):
+        self.length = length
+    def _parse(self, data, offset, ctx, end):
+        length = int(_eval(self.length, ctx))
+        if length < 0 or offset + length > end:
+            raise BinaryFormatError("Invalid byte length")
+        return data[offset:offset+length], offset+length
+    def _build(self, obj, ctx):
+        raw = bytes(obj or b"")
+        length = int(_eval(self.length, ctx))
+        if length < 0 or len(raw) != length:
+            raise BinaryFormatError(f"Expected {length} bytes, got {len(raw)}")
+        return raw
+
+def Bytes(length):
+    return _BytesField(length)
+
+class _GreedyBytesField(_Field):
+    def _parse(self, data, offset, ctx, end):
+        return data[offset:end], end
+    def _build(self, obj, ctx):
+        return bytes(obj or b"")
+
+GreedyBytes = _GreedyBytesField()
+
+def String(length):
+    return Bytes(length)
+
+class _ConstField(_Field):
+    def __init__(self, subcon, expected=None):
+        if expected is None and isinstance(subcon, (bytes, bytearray)):
+            self.expected = bytes(subcon)
+            self.subcon = Bytes(len(self.expected))
+        else:
+            self.subcon = _coerce(subcon)
+            self.expected = expected
+    def _parse(self, data, offset, ctx, end):
+        value, offset = self.subcon._parse(data, offset, ctx, end)
+        if value != self.expected:
+            raise BinaryFormatError(f"Expected constant {self.expected!r}, got {value!r}")
+        return value, offset
+    def _build(self, obj, ctx):
+        return self.subcon._build(self.expected, ctx)
+
+def Const(subcon, expected=None):
+    return _ConstField(subcon, expected)
+
+class _EmbeddedField(_Field):
+    def __init__(self, subcon):
+        self.subcon = _coerce(subcon)
+    def _parse(self, data, offset, ctx, end):
+        value, offset = self.subcon._parse(data, offset, ctx, end)
+        return value, offset
+    def _build(self, obj, ctx):
+        return self.subcon._build(obj, ctx)
+
+def Embedded(subcon):
+    return _EmbeddedField(subcon)
+
+class _StructField(_Field):
+    def __init__(self, *subcons):
+        self.subcons = list(subcons)
+    def _parse(self, data, offset, parent_ctx, end):
+        ctx = _Context(_parent=parent_ctx)
+        for field in self.subcons:
+            if isinstance(field, _NamedField):
+                value, offset = field._parse(data, offset, ctx, end)
+                ctx[field.name] = value
+            elif isinstance(field, _EmbeddedField):
+                value, offset = field._parse(data, offset, ctx, end)
+                if isinstance(value, dict):
+                    ctx.update(value)
+            else:
+                field = _coerce(field)
+                value, offset = field._parse(data, offset, ctx, end)
+                if isinstance(value, dict):
+                    ctx.update(value)
+        return Container(ctx), offset
+    def _build(self, obj, parent_ctx):
+        source = obj if isinstance(obj, dict) else Container()
+        ctx = _Context(source, _parent=parent_ctx)
+        chunks = []
+        for field in self.subcons:
+            if isinstance(field, _NamedField):
+                value = source.get(field.name)
+                chunk = field._build(value, ctx)
+                chunks.append(chunk)
+                if isinstance(field.subcon, _RebuildField):
+                    ctx[field.name] = field.subcon.last_value
+                elif field.name not in ctx and value is not None:
+                    ctx[field.name] = value
+            elif isinstance(field, _EmbeddedField):
+                chunks.append(field._build(source, ctx))
+            else:
+                chunks.append(_coerce(field)._build(source, ctx))
+        return b"".join(chunks)
+
+def Struct(*subcons):
+    return _StructField(*subcons)
+
+class _ArrayField(_Field):
+    def __init__(self, count, subcon):
+        self.count = count
+        self.subcon = _coerce(subcon)
+    def _parse(self, data, offset, ctx, end):
+        count = int(_eval(self.count, ctx))
+        out = ListContainer()
+        for _ in range(count):
+            value, offset = self.subcon._parse(data, offset, ctx, end)
+            out.append(value)
+        return out, offset
+    def _build(self, obj, ctx):
+        values = list(obj or [])
+        expected = int(_eval(self.count, ctx))
+        if len(values) != expected:
+            raise BinaryFormatError(f"Expected {expected} array items, got {len(values)}")
+        return b"".join(self.subcon._build(value, ctx) for value in values)
+
+def Array(count, subcon):
+    return _ArrayField(count, subcon)
+
+class _GreedyRangeField(_Field):
+    def __init__(self, subcon):
+        self.subcon = _coerce(subcon)
+    def _parse(self, data, offset, ctx, end):
+        out = ListContainer()
+        while offset < end:
+            start = offset
+            try:
+                value, new_offset = self.subcon._parse(data, offset, ctx, end)
+                if new_offset <= offset:
+                    break
+                out.append(value)
+                offset = new_offset
+            except Exception:
+                offset = start
+                break
+        return out, offset
+    def _build(self, obj, ctx):
+        return b"".join(self.subcon._build(value, ctx) for value in (obj or []))
+
+def GreedyRange(subcon):
+    return _GreedyRangeField(subcon)
+
+class _SwitchField(_Field):
+    def __init__(self, key, cases, default=None):
+        self.key = key
+        self.cases = cases
+        self.default = default
+    def _selected(self, ctx):
+        key = _eval(self.key, ctx)
+        selected = self.cases.get(key, self.default)
+        if selected is None:
+            raise BinaryFormatError(f"No switch case for {key!r}")
+        return _coerce(selected)
+    def _parse(self, data, offset, ctx, end):
+        return self._selected(ctx)._parse(data, offset, ctx, end)
+    def _build(self, obj, ctx):
+        return self._selected(ctx)._build(obj, ctx)
+
+def Switch(key, cases, default=None):
+    return _SwitchField(key, cases, default)
+
+class _LazyBoundField(_Field):
+    def __init__(self, callback):
+        self.callback = callback
+    def _get(self, ctx):
+        try:
+            return _coerce(self.callback(ctx))
+        except TypeError:
+            return _coerce(self.callback())
+    def _parse(self, data, offset, ctx, end):
+        return self._get(ctx)._parse(data, offset, ctx, end)
+    def _build(self, obj, ctx):
+        return self._get(ctx)._build(obj, ctx)
+
+def LazyBound(callback):
+    return _LazyBoundField(callback)
+
+class Adapter(_Field):
+    def __init__(self, subcon):
+        self.subcon = _coerce(subcon)
+    def _decode(self, obj, context):
+        return obj
+    def _encode(self, obj, context):
+        return obj
+    def _parse(self, data, offset, ctx, end):
+        value, offset = self.subcon._parse(data, offset, ctx, end)
+        return self._decode(value, ctx), offset
+    def _build(self, obj, ctx):
+        return self.subcon._build(self._encode(obj, ctx), ctx)
+
+class _OneOfField(_Field):
+    def __init__(self, subcon, allowed):
+        self.subcon = _coerce(subcon)
+        self.allowed = set(allowed)
+    def _parse(self, data, offset, ctx, end):
+        value, offset = self.subcon._parse(data, offset, ctx, end)
+        if value not in self.allowed:
+            raise BinaryFormatError(f"Unexpected value {value!r}")
+        return value, offset
+    def _build(self, obj, ctx):
+        if obj not in self.allowed:
+            raise BinaryFormatError(f"Unexpected value {obj!r}")
+        return self.subcon._build(obj, ctx)
+
+def OneOf(subcon, allowed):
+    return _OneOfField(subcon, allowed)
+
+class _IfField(_Field):
+    def __init__(self, condition, subcon):
+        self.condition = condition
+        self.subcon = _coerce(subcon)
+    def _parse(self, data, offset, ctx, end):
+        if _eval(self.condition, ctx):
+            return self.subcon._parse(data, offset, ctx, end)
+        return None, offset
+    def _build(self, obj, ctx):
+        if _eval(self.condition, ctx):
+            return self.subcon._build(obj, ctx)
+        return b""
+
+def If(condition, subcon):
+    return _IfField(condition, subcon)
+
+class _SelectField(_Field):
+    def __init__(self, *subcons):
+        self.subcons = [_coerce(x) for x in subcons]
+    def _parse(self, data, offset, ctx, end):
+        last = None
+        for subcon in self.subcons:
+            try:
+                return subcon._parse(data, offset, ctx, end)
+            except Exception as exc:
+                last = exc
+        raise BinaryFormatError("No Select alternative matched") from last
+    def _build(self, obj, ctx):
+        last = None
+        for subcon in self.subcons:
+            try:
+                return subcon._build(obj, ctx)
+            except Exception as exc:
+                last = exc
+        raise BinaryFormatError("No Select alternative could build") from last
+
+def Select(*subcons):
+    return _SelectField(*subcons)
+
+class _LiteralField(_Field):
+    def __init__(self, value):
+        self.value = value
+    def _parse(self, data, offset, ctx, end):
+        return self.value, offset
+    def _build(self, obj, ctx):
+        return b""
+
+class _RebuildField(_Field):
+    def __init__(self, subcon, callback):
+        self.subcon = _coerce(subcon)
+        self.callback = callback
+        self.last_value = None
+    def _parse(self, data, offset, ctx, end):
+        return self.subcon._parse(data, offset, ctx, end)
+    def _build(self, obj, ctx):
+        value = _eval(self.callback, ctx)
+        self.last_value = value
+        return self.subcon._build(value, ctx)
+
+def Rebuild(subcon, callback):
+    return _RebuildField(subcon, callback)
+
+class _DefaultField(_Field):
+    def __init__(self, subcon, default):
+        self.subcon = _coerce(subcon)
+        self.default = default
+    def _parse(self, data, offset, ctx, end):
+        return self.subcon._parse(data, offset, ctx, end)
+    def _build(self, obj, ctx):
+        if obj is None:
+            obj = self.default
+        return self.subcon._build(obj, ctx)
+
+def Default(subcon, default):
+    return _DefaultField(subcon, default)
+
+class _PrefixedArrayField(_Field):
+    def __init__(self, countfield, subcon):
+        self.countfield = _coerce(countfield)
+        self.subcon = _coerce(subcon)
+    def _parse(self, data, offset, ctx, end):
+        count, offset = self.countfield._parse(data, offset, ctx, end)
+        out = ListContainer()
+        for _ in range(int(count)):
+            value, offset = self.subcon._parse(data, offset, ctx, end)
+            out.append(value)
+        return out, offset
+    def _build(self, obj, ctx):
+        values = list(obj or [])
+        return self.countfield._build(len(values), ctx) + b"".join(self.subcon._build(v, ctx) for v in values)
+
+def PrefixedArray(countfield, subcon):
+    return _PrefixedArrayField(countfield, subcon)
+
+class _PrefixedField(_Field):
+    def __init__(self, lengthfield, subcon):
+        self.lengthfield = _coerce(lengthfield)
+        self.subcon = _coerce(subcon)
+    def _parse(self, data, offset, ctx, end):
+        length, offset = self.lengthfield._parse(data, offset, ctx, end)
+        sub_end = offset + int(length)
+        if sub_end > end:
+            raise BinaryFormatError("Prefixed field exceeds input")
+        value, consumed = self.subcon._parse(data, offset, ctx, sub_end)
+        if consumed > sub_end:
+            raise BinaryFormatError("Prefixed field over-read")
+        return value, sub_end
+    def _build(self, obj, ctx):
+        payload = self.subcon._build(obj, ctx)
+        return self.lengthfield._build(len(payload), ctx) + payload
+
+def Prefixed(lengthfield, subcon):
+    return _PrefixedField(lengthfield, subcon)
+
+def _coerce(value):
+    if isinstance(value, _Field):
+        return value
+    return _LiteralField(value)
+
+
 
 class PlayReadyException(Exception):
     """Exceptions used by """
@@ -66,7 +549,6 @@ class ServerException(PlayReadyException):
 class InvalidRevocationList(PlayReadyException):
     """The RevocationList is not correctly formatted."""
 
-from enum import Enum
 
 class DrmResult(Enum):
     DRM_SUCCESS = (0x00000000, "Operation was successful.")
@@ -969,7 +1451,6 @@ class DrmResult(Enum):
                 return error
         raise ValueError("Invalid DRMResult")
 
-import xml.etree.ElementTree as ET
 
 class Util:
     @staticmethod
@@ -988,14 +1469,7 @@ class Util:
             byte_len += 1
         return n.to_bytes(byte_len, 'big')
 
-import base64
-from pathlib import Path
-from typing import Union
 
-from Crypto.Hash import SHA256
-from Crypto.PublicKey import ECC
-from Crypto.PublicKey.ECC import EccKey
-from ecpy.curves import Curve, Point
 
 class ECCKey:
     def __init__(self, key: EccKey):
@@ -1067,9 +1541,6 @@ class ECCKey:
         hash_object.update(self.public_bytes())
         return hash_object.digest()
 
-from typing import Tuple
-from ecpy.curves import Curve, Point
-import secrets
 
 class ElGamal:
     curve = Curve.get_curve("secp256r1")
@@ -1088,9 +1559,6 @@ class ElGamal:
         decrypted_message = point2 - shared_secret
         return decrypted_message
 
-from Crypto.Cipher import AES
-from Crypto.Hash import CMAC
-from cryptography.hazmat.primitives.keywrap import aes_key_unwrap
 
 def derive_wrapping_key() -> bytes:
     KeyDerivationCertificatePrivateKeysWrap = bytes([
@@ -1123,7 +1591,6 @@ def unwrap_wrapped_key(wrapped_key: bytes) -> bytes:
 
     return unwrapped_key[:32]
 
-from construct import Struct, Const, Int8ub, Bytes, this, Int32ub, Switch, Embedded
 
 class DeviceStructs:
     magic = Const(b"PRD")
@@ -1163,22 +1630,12 @@ class DeviceStructs:
         ))
     )
 
-import collections.abc
 
 if not hasattr(collections, 'Sequence'):
     collections.Sequence = collections.abc.Sequence
 
-import time
-import base64
-from pathlib import Path
-from typing import Union, Optional
-from enum import IntEnum
 
-from Crypto.PublicKey import ECC
 
-from construct import Bytes, Const, Int32ub, GreedyRange, Switch, Container, ListContainer, Embedded
-from construct import Int16ub, Array
-from construct import Struct, this
 
 class BCertCertType(IntEnum):
     UNKNOWN = 0x00000000
@@ -1779,7 +2236,11 @@ class CertificateChain(_BCertStructs):
         return self.get(0).get_security_level()
 
     def get_name(self) -> str:
-        return self.get(0).get_name()
+        for index in range(self.count()):
+            name = self.get(index).get_name()
+            if name and str(name).strip():
+                return name
+        return "unknown_device"
 
     def verify_chain(
             self,
@@ -1865,10 +2326,6 @@ class CertificateChain(_BCertStructs):
     def count(self) -> int:
         return self.parsed.certificate_count
 
-import base64
-from enum import IntEnum
-from pathlib import Path
-from typing import Union, Any, Optional
 
 class Device:
     CURRENT_VERSION = 3
@@ -1955,10 +2412,6 @@ class Device:
         name = f"{self.group_certificate.get_name()}_sl{self.group_certificate.get_security_level()}"
         return ''.join(char for char in name if (char.isalnum() or char in '_- ')).strip().lower().replace(" ", "_")
 
-import base64
-from enum import Enum
-from uuid import UUID
-from typing import Union
 
 class Key:
     class KeyType(Enum):
@@ -2003,6 +2456,14 @@ class Key:
         self.key_length = key_length
         self.key = key
 
+    @property
+    def type(self) -> str:
+        return self.key_type.name
+
+    @property
+    def kid(self) -> UUID:
+        return self.key_id
+
     @staticmethod
     def kid_to_uuid(kid: Union[str, bytes]) -> UUID:
         if isinstance(kid, str):
@@ -2018,7 +2479,6 @@ class Key:
 
         return UUID(bytes=kid)
 
-from ecpy.curves import Point, Curve
 
 class XmlKey:
 
@@ -2036,10 +2496,7 @@ class XmlKey:
     def get_point(self) -> Point:
         return Point(self.shared_key_x, self.shared_key_y, self.curve)
     
-import time
-from typing import Optional
 
-from Crypto.Random import get_random_bytes
 
 class Session:
     def __init__(self, number: int):
@@ -2051,15 +2508,7 @@ class Session:
         self.keys: list[Key] = []
         self.opened_at: float = time.time()
 
-import base64
-from enum import IntEnum
-from typing import Union, Tuple
-from uuid import UUID
 
-from Crypto.Cipher import AES
-from Crypto.Hash import CMAC
-from Crypto.Util.strxor import strxor
-from construct import Const, GreedyRange, Struct, Int32ub, Bytes, Int16ub, this, Switch, LazyBound, Array, Container
 
 class XMRObjectTypes(IntEnum):
     INVALID = 0x0000
@@ -2456,17 +2905,11 @@ class XMRLicense(_XMRLicenseStructs):
 
         return signature_data.signature_data == cmac.digest()
     
-import base64
-import copy
-import hashlib
-import xml.etree.ElementTree as ET
-from typing import Union, Iterator
 
-from Crypto.PublicKey import ECC
 
 class License:
     def __init__(self, data: Union[str, bytes, ET.Element]):
-        if not data:
+        if data is None or (isinstance(data, (str, bytes)) and len(data) == 0):
             raise InvalidLicense("Data must not be empty")
 
         if isinstance(data, str):
@@ -2511,7 +2954,7 @@ class License:
 
     def _find_element_raw(self, name: str) -> ET.Element:
         return self._original_root.find(f".//{name}", {
-            "": "http://www.w3.org/2000/09/xmldsig#",
+            "": "http://www.w3.org/2000/09/xmldsig\x23",
             "soap": "http://schemas.xmlsoap.org/soap/envelope/",
             "proto": "http://schemas.microsoft.com/DRM/2007/03/protocols",
             "msg": "http://schemas.microsoft.com/DRM/2007/03/protocols/messages"
@@ -2564,7 +3007,7 @@ class License:
             curve="P-256"
         )
 
-        ET.register_namespace("", "http://www.w3.org/2000/09/xmldsig#")
+        ET.register_namespace("", "http://www.w3.org/2000/09/xmldsig\x23")
         signed_info_xml = ET.tostring(self._find_element_raw("SignedInfo"), short_empty_elements=False)
 
         signature_value = base64.b64decode(Signature.findtext("SignatureValue"))
@@ -2574,25 +3017,7 @@ class License:
 
         return True
 
-import base64
-import hashlib
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Union, Optional, Iterator
-from uuid import UUID
 
-from Crypto.PublicKey import ECC
-from construct import Struct, Bytes, Switch, Int64ul, Int64ub, Int32ub, \
-    Int16ub, Int8ub, Array, this, Adapter, OneOf, If, Container, Select, GreedyBytes, String
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from ecpy import curve_defs
-from ecpy.curve_defs import WEIERSTRASS
-from ecpy.curves import Curve, Point
-from ecpy.ecdsa import ECDSA
-from ecpy.keys import ECPublicKey
-import xml.etree.ElementTree as ET
 
 class FileTime(Adapter):
     EPOCH_AS_FILETIME = 116444736000000000
@@ -2705,8 +3130,6 @@ class RevocationList(_RevocationStructs):
         0xef, 0x9c, 0x89, 0x6b, 0xf2, 0xc4, 0x81, 0x1d, 0xa2, 0x12
     ])
 
-    CurrentRevListStorageName = "RevInfo_Current.xml"
-
     def __init__(self, parsed):
         self.parsed = parsed
 
@@ -2818,7 +3241,7 @@ class RevocationList(_RevocationStructs):
         root = ET.fromstring(data)
 
         ET.register_namespace("c", "http://schemas.microsoft.com/DRM/2004/02/cert")
-        ET.register_namespace("", "http://www.w3.org/2000/09/xmldsig#")
+        ET.register_namespace("", "http://www.w3.org/2000/09/xmldsig\x23")
 
         _ns = {"c": "http://schemas.microsoft.com/DRM/2004/02/cert"}
 
@@ -3042,9 +3465,6 @@ class RevocationList(_RevocationStructs):
 
         return f"{list_name}v{list_version}_{list_date}.xml"
 
-import html
-import xml.etree.ElementTree as ET
-from typing import Union, Optional
 
 class SoapMessage:
     XML_DECLARATION = '<?xml version="1.0" encoding="utf-8"?>'
@@ -3087,7 +3507,9 @@ class SoapMessage:
         return cls(root)
 
     def get_message(self) -> Optional[ET.Element]:
-        Body = self.root.find("soap:Body", self._NS) or self.root.find("envelope:Body", self._NS)
+        Body = self.root.find("soap:Body", self._NS)
+        if Body is None:
+            Body = self.root.find("envelope:Body", self._NS)
         if Body is None:
             return None
 
@@ -3128,50 +3550,8 @@ class SoapMessage:
 
         return self.XML_DECLARATION + html.unescape(xml_data.decode())
 
-import os
-from pathlib import Path
-from typing import Optional
 
-from platformdirs import user_data_dir
 
-class Storage:
-
-    @staticmethod
-    def _get_initialized_path() -> Path:
-        storage_path = Path(user_data_dir("playready", "DevLARLEY"))
-        storage_path.mkdir(parents=True, exist_ok=True)
-        return storage_path
-
-    @staticmethod
-    def write_file(file_name: str, data: bytes) -> bool:
-        storage_path = Storage._get_initialized_path()
-        storage_file = storage_path / file_name
-
-        new_file = not storage_file.exists()
-
-        storage_file.write_bytes(data)
-
-        return new_file
-
-    @staticmethod
-    def read_file(file_name: str) -> Optional[bytes]:
-        storage_path = Storage._get_initialized_path()
-        storage_file = storage_path / file_name
-
-        if not storage_file.exists():
-            return None
-
-        return storage_file.read_bytes()
-
-import base64
-import hashlib
-import html
-import time
-import xml.etree.ElementTree as ET
-from typing import Optional, List
-from uuid import UUID
-
-from Crypto.Random import get_random_bytes
 
 class XmlBuilder:
 
@@ -3200,25 +3580,8 @@ class XmlBuilder:
     def _RevocationLists(parent: ET.Element, rev_lists: List[UUID]) -> ET.Element:
         RevocationLists = ET.SubElement(parent, "RevocationLists")
 
-        load_result = Storage.read_file(RevocationList.CurrentRevListStorageName)
-        if load_result is None:
-            for rev_list in rev_lists:
-                XmlBuilder._RevListInfo(RevocationLists, rev_list, 0)
-
-            return RevocationLists
-
-        loaded_list = RevocationList.loads(load_result)
-
-        for list_id, list_data in loaded_list.parsed:
-            if list_id not in rev_lists:
-                continue
-
-            if list_id == RevocationList.ListID.REV_INFO_V2:
-                version = list_data.data.sequence_number
-            else:
-                version = list_data.data.version
-
-            XmlBuilder._RevListInfo(RevocationLists, list_id, version)
+        for rev_list in rev_lists:
+            XmlBuilder._RevListInfo(RevocationLists, rev_list, 0)
 
         return RevocationLists
 
@@ -3262,26 +3625,26 @@ class XmlBuilder:
         ClientTime.text = str(int(time.time()))
 
         EncryptedData = ET.SubElement(LA, "EncryptedData", {
-            "xmlns": "http://www.w3.org/2001/04/xmlenc#",
-            "Type": "http://www.w3.org/2001/04/xmlenc#Element"
+            "xmlns": "http://www.w3.org/2001/04/xmlenc\x23",
+            "Type": "http://www.w3.org/2001/04/xmlenc\x23Element"
         })
         ET.SubElement(EncryptedData, "EncryptionMethod", {
-            "Algorithm": "http://www.w3.org/2001/04/xmlenc#aes128-cbc"
+            "Algorithm": "http://www.w3.org/2001/04/xmlenc\x23aes128-cbc"
         })
 
         KeyInfo = ET.SubElement(EncryptedData, "KeyInfo", {
-            "xmlns": "http://www.w3.org/2000/09/xmldsig#"
+            "xmlns": "http://www.w3.org/2000/09/xmldsig\x23"
         })
 
         EncryptedKey = ET.SubElement(KeyInfo, "EncryptedKey", {
-            "xmlns": "http://www.w3.org/2001/04/xmlenc#"
+            "xmlns": "http://www.w3.org/2001/04/xmlenc\x23"
         })
         ET.SubElement(EncryptedKey, "EncryptionMethod", {
-            "Algorithm": "http://schemas.microsoft.com/DRM/2007/03/protocols#ecc256"
+            "Algorithm": "http://schemas.microsoft.com/DRM/2007/03/protocols\x23ecc256"
         })
 
         KeyInfoInner = ET.SubElement(EncryptedKey, "KeyInfo", {
-            "xmlns": "http://www.w3.org/2000/09/xmldsig#"
+            "xmlns": "http://www.w3.org/2000/09/xmldsig\x23"
         })
         KeyName = ET.SubElement(KeyInfoInner, "KeyName")
         KeyName.text = "WMRMServer"
@@ -3297,20 +3660,20 @@ class XmlBuilder:
     @staticmethod
     def _SignedInfo(parent: ET.Element, digest_value: bytes) -> ET.Element:
         SignedInfo = ET.SubElement(parent, "SignedInfo", {
-            "xmlns": "http://www.w3.org/2000/09/xmldsig#"
+            "xmlns": "http://www.w3.org/2000/09/xmldsig\x23"
         })
         ET.SubElement(SignedInfo, "CanonicalizationMethod", {
             "Algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
         })
         ET.SubElement(SignedInfo, "SignatureMethod", {
-            "Algorithm": "http://schemas.microsoft.com/DRM/2007/03/protocols#ecdsa-sha256"
+            "Algorithm": "http://schemas.microsoft.com/DRM/2007/03/protocols\x23ecdsa-sha256"
         })
 
         Reference = ET.SubElement(SignedInfo, "Reference", {
-            "URI": "#SignedData"
+            "URI": "\x23SignedData"
         })
         ET.SubElement(Reference, "DigestMethod", {
-            "Algorithm": "http://schemas.microsoft.com/DRM/2007/03/protocols#sha256"
+            "Algorithm": "http://schemas.microsoft.com/DRM/2007/03/protocols\x23sha256"
         })
         DigestValue = ET.SubElement(Reference, "DigestValue")
         DigestValue.text = base64.b64encode(digest_value).decode()
@@ -3339,7 +3702,7 @@ class XmlBuilder:
         LA = XmlBuilder._LicenseAcquisition(Challenge, wrmheader, protocol_version, wrmserver_data, client_data, client_info, revocation_lists, custom_data)
 
         Signature = ET.SubElement(Challenge, "Signature", {
-            "xmlns": "http://www.w3.org/2000/09/xmldsig#"
+            "xmlns": "http://www.w3.org/2000/09/xmldsig\x23"
         })
 
         la_xml = ET.tostring(
@@ -3367,7 +3730,7 @@ class XmlBuilder:
             ET.SubElement(
                 ET.SubElement(
                     Signature, "KeyInfo", {
-                        "xmlns": "http://www.w3.org/2000/09/xmldsig#"
+                        "xmlns": "http://www.w3.org/2000/09/xmldsig\x23"
                     }
                 ),
                 "KeyValue"
@@ -3401,13 +3764,6 @@ class XmlBuilder:
             short_empty_elements=False
         ).decode()
 
-import base64
-import hashlib
-from enum import Enum
-from typing import List, Optional, Union
-from uuid import UUID
-import xml.etree.ElementTree as ET
-from Crypto.Cipher import AES
 
 class WRMHeader:
 
@@ -3582,12 +3938,7 @@ class WRMHeader:
     def dumps(self) -> str:
         return self._raw_data.decode("utf-16-le")
 
-import base64
-from typing import Union, List
-from uuid import UUID
 
-from construct import Struct, Int32ul, Int16ul, this, Bytes, Switch, Int8ub, Int24ub, Int32ub, Const, Container, \
-    ConstructError, Rebuild, Default, If, PrefixedArray, Prefixed, GreedyBytes
 
 class _PlayreadyPSSHStructs:
     PsshBox = Struct(
@@ -3639,18 +3990,18 @@ class PSSH(_PlayreadyPSSHStructs):
             else:
                 prh = self.PlayreadyHeader.parse(box.data)
                 self.wrm_headers = self._read_playready_objects(prh)
-        except ConstructError:
+        except BinaryFormatError:
             if int.from_bytes(data[:2], byteorder="little") > 3:
                 try:
                     prh = self.PlayreadyHeader.parse(data)
                     self.wrm_headers = self._read_playready_objects(prh)
-                except ConstructError:
+                except BinaryFormatError:
                     raise InvalidPssh("Could not parse data as a PSSH Box nor a PlayReady Header")
             else:
                 try:
                     pro = self.PlayreadyObject.parse(data)
                     self.wrm_headers = [WRMHeader(pro.data)]
-                except ConstructError:
+                except BinaryFormatError:
                     raise InvalidPssh("Could not parse data as a PSSH Box nor a PlayReady Object")
 
     @staticmethod
@@ -3679,14 +4030,7 @@ class PSSH(_PlayreadyPSSHStructs):
             )
         ))
 
-import time
-import xml.etree.ElementTree as ET
-from typing import List, Union, Optional
-from uuid import UUID
 
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
-from ecpy.curves import Point, Curve
 
 class Cdm:
     MAX_NUM_OF_SESSIONS = 16
@@ -3825,22 +4169,6 @@ class Cdm:
         if licence.is_verifiable():
             licence.verify()
 
-        if licence.rev_info is not None:
-            current_rev_info_file = Storage.read_file(RevocationList.CurrentRevListStorageName)
-
-            if current_rev_info_file:
-                new_rev_info = RevocationList.merge(ET.fromstring(current_rev_info_file), licence.rev_info)
-            else:
-                new_rev_info = licence.rev_info
-
-            new_rev_info_xml = ET.tostring(
-                new_rev_info,
-                xml_declaration=True,
-                encoding="utf-8"
-            )
-            Storage.write_file(RevocationList.CurrentRevListStorageName, new_rev_info_xml)
-            Storage.write_file(RevocationList.loads(new_rev_info).get_storage_file_name(), new_rev_info_xml)
-
         for xmr_license in licence.licenses:
             session.keys.append(xmr_license.get_content_key(session.encryption_key))
 
@@ -3851,22 +4179,8 @@ class Cdm:
 
         return session.keys
 
-import logging
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
-import click
-import requests
-from Crypto.Random import get_random_bytes
 
-__version__ = "0.8.4"
 
-from typing import Union, Tuple
-from Crypto.Hash import SHA256
-from Crypto.Hash.SHA256 import SHA256Hash
-from Crypto.PublicKey.ECC import EccKey
-from Crypto.Signature import DSS
-from ecpy.curves import Point, Curve
 
 class Crypto:
     curve = Curve.get_curve("secp256r1")
@@ -3969,7 +4283,6 @@ class PlayReadyPsshKeyIdExtractor:
             if start < 0 or end <= len("</WRMHEADER>"):
                 return key_ids
             xml_data = decoded_text[start:end]
-            import xml.etree.ElementTree as ElementTree
             root = ElementTree.fromstring(xml_data)
             for element in root.iter():
                 element.tag = element.tag.split("}", 1)[-1] if "}" in element.tag else element.tag
@@ -4026,7 +4339,6 @@ class PlayReadyHeaderBuilder:
 
     @staticmethod
     def compute_checksum(key_id: bytes, key: bytes) -> bytes:
-        from Crypto.Cipher import AES
         cipher = AES.new(key, AES.MODE_ECB)
         return cipher.encrypt(key_id)[:8]
 
@@ -4066,7 +4378,7 @@ class PlayReadyHeaderBuilder:
             raise ValueError("AESCBC requires PlayReady 4.3 or higher.")
         if header_spec is None:
             header_spec = ""
-        if header_spec.startswith("#"):
+        if header_spec.startswith("\x23"):
             header = self.decode_base64(header_spec[1:])
             if not header:
                 raise ValueError("Invalid Base64 header data.")
@@ -4086,7 +4398,7 @@ class PlayReadyHeaderBuilder:
             return self.wrap_header_xml(header_xml) if header_xml is not None else header
         fields: dict[str, str] = {}
         if header_spec:
-            for pair in header_spec.split("#"):
+            for pair in header_spec.split("\x23"):
                 if not pair:
                     continue
                 if ":" not in pair:
@@ -4126,7 +4438,6 @@ class PlayReadyHeaderBuilder:
         if swap:
             key_id = key_id[3:4] + key_id[2:3] + key_id[1:2] + key_id[0:1] + key_id[5:6] + key_id[4:5] + key_id[7:8] + key_id[6:7] + key_id[8:]
         seed = seed[:30]
-        import hashlib
         sha_a = hashlib.sha256(seed + key_id).digest()
         sha_b = hashlib.sha256(seed + key_id + seed).digest()
         sha_c = hashlib.sha256(seed + key_id + seed + key_id).digest()
@@ -4207,7 +4518,6 @@ class InitializationPsshExtractor:
         executable = Path(mp4dump_exe)
         if not executable.exists():
             raise EnvironmentError(f"mp4dump executable was not found: {executable}")
-        import subprocess
         process = subprocess.run([str(executable), "--format", "json", "--verbosity", "3", str(init_mp4)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         data = json.loads(process.stdout.decode("utf-8"))
         for item in data:
@@ -4245,6 +4555,14 @@ def parse_http_headers(values: Optional[list[str]]) -> dict[str, str]:
         name, value = item.split(":", 1)
         headers[name.strip()] = value.strip().strip('"')
     return headers
+
+def default_license_headers() -> list[str]:
+    return [
+        "User-Agent: Mozilla/5.0 (Linux; U; SmartTV; PlayReady) AppleWebKit/537.36 (KHTML, like Gecko) SmartTV/6.0",
+        "Accept-Encoding: gzip, deflate, br, zstd",
+        "Accept: */*",
+        "Connection: keep-alive",
+    ]
 
 def get_device_display_name(device: Device) -> str:
     if hasattr(device, "get_name"):
@@ -4388,7 +4706,7 @@ def command_create_device(args: argparse.Namespace) -> int:
     )
     output_path = resolve_prd_output_path(args.output, device)
     if output_path.exists() and not args.overwrite:
-        print(f"A file already exists at the path '{output_path}', cannot overwrite.")
+        print(f"A file already exists at the path '{output_path.name}', cannot overwrite.")
         return 1
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(device.dumps())
@@ -4398,7 +4716,7 @@ def command_create_device(args: argparse.Namespace) -> int:
     print(f"Encryption Key: {len(device.encryption_key.dumps())} bytes")
     print(f"Signing Key: {len(device.signing_key.dumps())} bytes")
     print(f"Group Certificate: {len(device.group_certificate.dumps())} bytes")
-    print(f"Saved to: {output_path.absolute()}")
+    print(f"Saved to: {output_path.name}")
     return 0
 
 def command_build_device(args: argparse.Namespace) -> int:
@@ -4428,7 +4746,7 @@ def command_build_device(args: argparse.Namespace) -> int:
     )
     output_path = resolve_prd_output_path(args.output, device)
     if output_path.exists() and not args.overwrite:
-        print(f"A file already exists at the path '{output_path}', cannot overwrite.")
+        print(f"A file already exists at the path '{output_path.name}', cannot overwrite.")
         return 1
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(device.dumps(version=2))
@@ -4437,7 +4755,7 @@ def command_build_device(args: argparse.Namespace) -> int:
     print(f"Encryption Key: {len(device.encryption_key.dumps())} bytes")
     print(f"Signing Key: {len(device.signing_key.dumps())} bytes")
     print(f"Group Certificate: {len(device.group_certificate.dumps())} bytes")
-    print(f"Saved to: {output_path.absolute()}")
+    print(f"Saved to: {output_path.name}")
     return 0
 
 def command_export_device(args: argparse.Namespace) -> int:
@@ -4451,9 +4769,9 @@ def command_export_device(args: argparse.Namespace) -> int:
         return 1
     output_path.mkdir(parents=True, exist_ok=True)
     device = Device.load(input_path)
-    print(f"Exporting PlayReady Device file: {input_path.stem}")
+    print(f"Exporting PlayReady Device file: {input_path.name}")
     print(f"SL{device.security_level} {device.get_name()}")
-    print(f"Saving to: {output_path}")
+    print(f"Saving to: {output_path.name}")
     if device.group_key:
         group_key_path = output_path / "zgpriv.dat"
         group_key_path.write_bytes(device.group_key.dumps(private_only=True))
@@ -4495,11 +4813,11 @@ def command_reprovision_device(args: argparse.Namespace) -> int:
     device.group_certificate.verify_chain(check_expiry=True, cert_type=BCertCertType.DEVICE)
     output_path = Path(args.output) if args.output else input_path
     if output_path.exists() and output_path != input_path and not args.overwrite:
-        print(f"A file already exists at the path '{output_path}', cannot overwrite.")
+        print(f"A file already exists at the path '{output_path.name}', cannot overwrite.")
         return 1
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(device.dumps())
-    print(f"Reprovisioned PlayReady Device file: {output_path}")
+    print(f"Reprovisioned PlayReady Device file: {output_path.name}")
     return 0
 
 def command_inspect(args: argparse.Namespace) -> int:
@@ -4543,6 +4861,9 @@ def command_inspect(args: argparse.Namespace) -> int:
 
 def command_license(args: argparse.Namespace) -> int:
     pssh = PSSH(args.pssh)
+    if not pssh.wrm_headers:
+        raise InvalidPssh("PlayReady PSSH does not contain a WRMHEADER")
+    wrm_header = pssh.wrm_headers[0]
     if args.device:
         device = Device.load(args.device)
     elif args.device_dir:
@@ -4563,25 +4884,37 @@ def command_license(args: argparse.Namespace) -> int:
     cdm = Cdm.from_device(device) if hasattr(Cdm, "from_device") else Cdm(device)
     session_id = cdm.open()
     try:
-        challenge = cdm.get_license_challenge(session_id, pssh)
+        challenge = cdm.get_license_challenge(session_id, wrm_header)
         if args.challenge_output:
-            Path(args.challenge_output).write_bytes(challenge)
-            print(f"Wrote license challenge: {args.challenge_output}")
+            Path(args.challenge_output).write_text(challenge, encoding="utf-8")
+            print(f"Wrote license challenge: {Path(args.challenge_output).name}")
             return 0
         if not args.server and not args.license_response:
-            print(base64.b64encode(challenge).decode())
+            print(base64.b64encode(challenge.encode("utf-8")).decode())
             return 0
         if args.license_response:
             response_data = Path(args.license_response).read_bytes()
         else:
-            import requests
             response = requests.post(args.server, data=challenge, headers=parse_http_headers(args.header))
             response.raise_for_status()
             response_data = response.content
+        if isinstance(response_data, bytes):
+            decoded_response = None
+            for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be"):
+                try:
+                    decoded_response = response_data.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if decoded_response is None:
+                raise InvalidLicense("Unable to decode license response XML")
+            response_data = decoded_response
         cdm.parse_license(session_id, response_data)
         for key in cdm.get_keys(session_id):
-            if args.include_non_content or str(key.type).upper() == "CONTENT":
-                print(f"[{key.type}] {key.kid.hex}:{key.key.hex()}")
+            key_type = key.key_type.name
+            key_id = key.key_id
+            if args.include_non_content or key_type == "CONTENT":
+                print(f"[{key_type}] {key_id.hex}:{key.key.hex()}")
         return 0
     finally:
         cdm.close(session_id)
@@ -4638,7 +4971,7 @@ def command_kid_to_playready_header(args: argparse.Namespace) -> int:
     output = base64.b64encode(header).decode("utf-8")
     if args.output:
         Path(args.output).write_text(output, encoding="utf-8")
-        print(f"Wrote PlayReady header: {args.output}")
+        print(f"Wrote PlayReady header: {Path(args.output).name}")
     else:
         print(output)
     return 0
@@ -4663,7 +4996,7 @@ def command_extract_init_pssh(args: argparse.Namespace) -> int:
         return 1
     if args.output:
         Path(args.output).write_text(result, encoding="utf-8")
-        print(f"Wrote extracted data: {args.output}")
+        print(f"Wrote extracted data: {Path(args.output).name}")
     else:
         print(result)
     return 0
@@ -4674,107 +5007,177 @@ def command_extract_init_pssh_mp4dump(args: argparse.Namespace) -> int:
         return 1
     if args.output:
         Path(args.output).write_text(result, encoding="utf-8")
-        print(f"Wrote PlayReady PSSH: {args.output}")
+        print(f"Wrote PlayReady PSSH: {Path(args.output).name}")
     else:
         print(result)
     return 0
 
+def command_license_cli(args: argparse.Namespace) -> int:
+    args.device = args.device_path
+    args.device_dir = None
+    args.certificate = None
+    args.key = None
+    args.encryption_key = None
+    args.signing_key = None
+    args.header = default_license_headers()
+    args.challenge_output = None
+    args.license_response = None
+    args.include_non_content = True
+    return command_license(args)
+
+
+def command_test_cli(args: argparse.Namespace) -> int:
+    args.device_path = args.device
+    args.pssh = (
+        "AAADfHBzc2gAAAAAmgTweZhAQoarkuZb4IhflQAAA1xcAwAAAQABAFIDPABXAFIATQBIAEUAQQBEAEUAUgAgAHgAbQBsAG4AcwA9ACIAaAB0AH"
+        "QAcAA6AC8ALwBzAGMAaABlAG0AYQBzAC4AbQBpAGMAcgBvAHMAbwBmAHQALgBjAG8AbQAvAEQAUgBNAC8AMgAwADAANwAvADAAMwAvAFAAbABh"
+        "AHkAUgBlAGEAZAB5AEgAZQBhAGQAZQByACIAIAB2AGUAcgBzAGkAbwBuAD0AIgA0AC4AMAAuADAALgAwACIAPgA8AEQAQQBUAEEAPgA8AFAAUg"
+        "BPAFQARQBDAFQASQBOAEYATwA+ADwASwBFAFkATABFAE4APgAxADYAPAAvAEsARQBZAEwARQBOAD4APABBAEwARwBJAEQAPgBBAEUAUwBDAFQA"
+        "UgA8AC8AQQBMAEcASQBEAD4APAAvAFAAUgBPAFQARQBDAFQASQBOAEYATwA+ADwASwBJAEQAPgA0AFIAcABsAGIAKwBUAGIATgBFAFMAOAB0AE"
+        "cAawBOAEYAVwBUAEUASABBAD0APQA8AC8ASwBJAEQAPgA8AEMASABFAEMASwBTAFUATQA+AEsATABqADMAUQB6AFEAUAAvAE4AQQA9ADwALwBD"
+        "AEgARQBDAEsAUwBVAE0APgA8AEwAQQBfAFUAUgBMAD4AaAB0AHQAcABzADoALwAvAHAAcgBvAGYAZgBpAGMAaQBhAGwAcwBpAHQAZQAuAGsAZQ"
+        "B5AGQAZQBsAGkAdgBlAHIAeQAuAG0AZQBkAGkAYQBzAGUAcgB2AGkAYwBlAHMALgB3AGkAbgBkAG8AdwBzAC4AbgBlAHQALwBQAGwAYQB5AFIA"
+        "ZQBhAGQAeQAvADwALwBMAEEAXwBVAFIATAA+ADwAQwBVAFMAVABPAE0AQQBUAFQAUgBJAEIAVQBUAEUAUwA+ADwASQBJAFMAXwBEAFIATQBfAF"
+        "YARQBSAFMASQBPAE4APgA4AC4AMQAuADIAMwAwADQALgAzADEAPAAvAEkASQBTAF8ARABSAE0AXwBWAEUAUgBTAEkATwBOAD4APAAvAEMAVQBT"
+        "AFQATwBNAEEAVABUAFIASQBCAFUAVABFAFMAPgA8AC8ARABBAFQAQQA+ADwALwBXAFIATQBIAEUAQQBEAEUAUgA+AA=="
+    )
+    args.server = (
+        "https://test.playready.microsoft.com/service/rightsmanager.asmx"
+        f"?cfg=(persist:false,sl:{args.security_level},ckt:{args.ckt})"
+    )
+    return command_license_cli(args)
+
+
+def command_create_device_cli(args: argparse.Namespace) -> int:
+    args.key = args.group_key
+    args.protected_key = args.protected_group_key
+    args.certificate = args.group_certificate
+    args.overwrite = False
+    return command_create_device(args)
+
+
+def command_build_device_cli(args: argparse.Namespace) -> int:
+    args.certificate = args.group_certificate
+    args.overwrite = False
+    return command_build_device(args)
+
+
+def command_reprovision_device_cli(args: argparse.Namespace) -> int:
+    args.input = args.prd_path
+    args.overwrite = False
+    return command_reprovision_device(args)
+
+
+def command_export_device_cli(args: argparse.Namespace) -> int:
+    args.input = args.prd_path
+    args.output = args.out_dir
+    args.overwrite = False
+    return command_export_device(args)
+
+
+def command_serve_cli(args: argparse.Namespace) -> int:
+    raise RuntimeError("The single-file build does not include the remote serve implementation.")
+
+
+def command_header_cli(args: argparse.Namespace) -> int:
+    kid = args.kid.replace("-", "").strip()
+    if len(kid) != 32:
+        raise ValueError("KID must contain exactly 16 bytes (32 hexadecimal characters).")
+    bytes.fromhex(kid)
+    key = args.key.replace("-", "").strip() if args.key else kid
+    if len(key) != 32:
+        raise ValueError("Key must contain exactly 16 bytes (32 hexadecimal characters).")
+    bytes.fromhex(key)
+    builder = PlayReadyHeaderBuilder(kid)
+    header = builder.build_header(
+        version=args.header_version,
+        header_spec=args.header_spec,
+        encryption_scheme=args.encryption_scheme,
+        key_specs=[(kid, key)],
+        include_checksum=args.checksum,
+    )
+    encoded = base64.b64encode(header).decode("ascii")
+    print(f"PlayReady Header: {encoded}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pypr", description="Single-file PlayReady command line utility.")
+    parser = argparse.ArgumentParser(prog="pypr", description="Python PlayReady CDM utility")
+    parser.add_argument("-v", "--version", action="store_true", help="Print version information.")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable DEBUG level logs.")
     subcommands = parser.add_subparsers(dest="cmd")
 
-    parser_info = subcommands.add_parser("info", help="Display information about a PlayReady PRD device file.")
-    parser_info.add_argument("input")
-    parser_info.set_defaults(func=command_info)
+    parser_license = subcommands.add_parser("license", help="Make a License Request to a server using a given PSSH")
+    parser_license.add_argument("device_path")
+    parser_license.add_argument("pssh")
+    parser_license.add_argument("server")
+    parser_license.set_defaults(func=command_license_cli)
 
-    parser_create = subcommands.add_parser("create-device", help="Create a PlayReady PRD device file from an issuer certificate chain and group key.")
-    parser_create.add_argument("-c", "--certificate", "--group-certificate", dest="certificate", required=True)
-    parser_create.add_argument("-k", "--key", "--group-key", dest="key")
-    parser_create.add_argument("-pk", "--protected-key", "--protected-group-key", dest="protected_key")
-    parser_create.add_argument("-e", "--encryption-key", dest="encryption_key")
-    parser_create.add_argument("-s", "--signing-key", dest="signing_key")
-    parser_create.add_argument("-o", "--output")
-    parser_create.add_argument("--overwrite", action="store_true")
-    parser_create.set_defaults(func=command_create_device)
+    parser_test = subcommands.add_parser("test", help="Test the CDM using the PlayReady test service")
+    parser_test.add_argument("device")
+    parser_test.add_argument("-c", "--ckt", choices=["AES128BitCTR", "AES128BitCBC"], default="AES128BitCTR", help="Content Key Encryption Type")
+    parser_test.add_argument("-sl", "--security_level", choices=["150", "2000", "3000"], default="2000", help="Minimum Security Level")
+    parser_test.set_defaults(func=command_test_cli)
 
-    parser_build = subcommands.add_parser("build-device", help="Build a version 2 PlayReady PRD device file from encryption and signing keys.")
-    parser_build.add_argument("-e", "--encryption-key", dest="encryption_key", required=True)
-    parser_build.add_argument("-s", "--signing-key", dest="signing_key", required=True)
-    parser_build.add_argument("-c", "--certificate", "--group-certificate", dest="certificate", required=True)
-    parser_build.add_argument("-o", "--output")
-    parser_build.add_argument("--overwrite", action="store_true")
-    parser_build.set_defaults(func=command_build_device)
+    parser_header = subcommands.add_parser("header", help="Build a PlayReady Header")
+    parser_header.add_argument("kid", help="16-byte KID as 32 hexadecimal characters")
+    parser_header.add_argument("-k", "--key", default=None, help="Optional 16-byte content key. Defaults to the KID value.")
+    parser_header.add_argument("--version", dest="header_version", choices=["4.0", "4.1", "4.2", "4.3"], default="4.0", help="PlayReady header version")
+    parser_header.add_argument("--scheme", dest="encryption_scheme", choices=["cenc", "cens", "cbc1", "cbcs"], default="cenc", help="Encryption scheme")
+    parser_header.add_argument("--header-spec", default=None, help="Optional header specification or header file")
+    parser_header.add_argument("--checksum", action="store_true", help="Include a KID checksum when supported")
+    parser_header.set_defaults(func=command_header_cli)
 
-    parser_reprovision = subcommands.add_parser("reprovision-device", help="Reprovision a PlayReady PRD device file.")
-    parser_reprovision.add_argument("input")
-    parser_reprovision.add_argument("-e", "--encryption-key", dest="encryption_key")
-    parser_reprovision.add_argument("-s", "--signing-key", dest="signing_key")
-    parser_reprovision.add_argument("-o", "--output")
-    parser_reprovision.add_argument("--overwrite", action="store_true")
-    parser_reprovision.set_defaults(func=command_reprovision_device)
+    parser_create = subcommands.add_parser("create-device", help="Create a PlayReady Device (.prd) file")
+    parser_create.add_argument("-k", "--group_key", help="Device ECC private group key (zgpriv.dat)")
+    parser_create.add_argument("-pk", "--protected_group_key", help="Protected Device ECC private group key (zgpriv_protected.dat)")
+    parser_create.add_argument("-e", "--encryption_key", help="Optional Device ECC private encryption key (zprivencr.dat)")
+    parser_create.add_argument("-s", "--signing_key", help="Optional Device ECC private signing key (zprivsig.dat)")
+    parser_create.add_argument("-c", "--group_certificate", required=True, help="Device group certificate chain (bgroupcert.dat)")
+    parser_create.add_argument("-o", "--output", default=None, help="Output Path or Directory")
+    parser_create.set_defaults(func=command_create_device_cli)
 
-    parser_inspect = subcommands.add_parser("inspect", help="Inspect a PlayReady device or certificate chain.")
-    parser_inspect.add_argument("-d", "--device")
-    parser_inspect.add_argument("-c", "--chain")
+    parser_build = subcommands.add_parser("build-device", help="Build a version 2 PlayReady Device (.prd) file")
+    parser_build.add_argument("-e", "--encryption_key", required=True, help="Device ECC private encryption key (zprivencr.dat)")
+    parser_build.add_argument("-s", "--signing_key", required=True, help="Device ECC private signing key (zprivsig.dat)")
+    parser_build.add_argument("-c", "--group_certificate", required=True, help="Provisioned device group certificate chain")
+    parser_build.add_argument("-o", "--output", default=None, help="Output Path or Directory")
+    parser_build.set_defaults(func=command_build_device_cli)
+
+    parser_reprovision = subcommands.add_parser("reprovision-device", help="Reprovision a PlayReady Device (.prd)")
+    parser_reprovision.add_argument("prd_path")
+    parser_reprovision.add_argument("-e", "--encryption_key", help="Optional Device ECC private encryption key")
+    parser_reprovision.add_argument("-s", "--signing_key", help="Optional Device ECC private signing key")
+    parser_reprovision.add_argument("-o", "--output", default=None, help="Output Path or Directory")
+    parser_reprovision.set_defaults(func=command_reprovision_device_cli)
+
+    parser_inspect = subcommands.add_parser("inspect", help="Inspect a Device or Certificate Chain")
+    parser_inspect.add_argument("-d", "--device", default=None, help="PRD Device")
+    parser_inspect.add_argument("-c", "--chain", default=None, help="BCert Chain (bgroupcert.dat, bdevcert.dat)")
     parser_inspect.set_defaults(func=command_inspect)
 
-    parser_export = subcommands.add_parser("export-device", help="Export a PlayReady PRD device file to zgpriv.dat and bgroupcert.dat.")
-    parser_export.add_argument("input")
-    parser_export.add_argument("-o", "--output")
-    parser_export.add_argument("--overwrite", action="store_true")
-    parser_export.set_defaults(func=command_export_device)
+    parser_export = subcommands.add_parser("export-device", help="Export a PlayReady Device (.prd) file")
+    parser_export.add_argument("prd_path")
+    parser_export.add_argument("-o", "--out_dir", default=None, help="Output Directory")
+    parser_export.set_defaults(func=command_export_device_cli)
 
-    parser_license = subcommands.add_parser("license", help="Create a PlayReady license challenge and optionally parse a response.")
-    parser_license.add_argument("--pssh", required=True)
-    parser_license.add_argument("-d", "--device")
-    parser_license.add_argument("-D", "--device-dir")
-    parser_license.add_argument("-c", "--certificate", "--group-certificate", dest="certificate")
-    parser_license.add_argument("-k", "--key", "--group-key", dest="key")
-    parser_license.add_argument("-e", "--encryption-key", dest="encryption_key")
-    parser_license.add_argument("-s", "--signing-key", dest="signing_key")
-    parser_license.add_argument("--server")
-    parser_license.add_argument("-H", "--header", action="append", default=[])
-    parser_license.add_argument("--challenge-output")
-    parser_license.add_argument("--license-response")
-    parser_license.add_argument("--include-non-content", action="store_true")
-    parser_license.set_defaults(func=command_license)
+    parser_serve = subcommands.add_parser("serve", help="Serve local CDM and PlayReady Devices remotely", add_help=False)
+    parser_serve.add_argument("--help", action="help", help="Show this help message and exit.")
+    parser_serve.add_argument("config_path")
+    parser_serve.add_argument("-h", "--host", default="127.0.0.1", help="Host to serve from.")
+    parser_serve.add_argument("-p", "--port", type=int, default=7723, help="Port to serve from.")
+    parser_serve.set_defaults(func=command_serve_cli)
 
-    parser_kids = subcommands.add_parser("pssh-to-kids", help="Extract PlayReady KIDs from a PlayReady PSSH or header.")
-    parser_kids.add_argument("pssh")
-    parser_kids.add_argument("--json", action="store_true")
-    parser_kids.set_defaults(func=command_pssh_to_kids)
-
-    parser_header = subcommands.add_parser("kid-to-header", help="Build a Base64 PlayReady header from one or more KIDs.")
-    parser_header.add_argument("-k", "--key", action="append", required=True, help="KID or KID:KEY. Can be repeated.")
-    parser_header.add_argument("-v", "--version", default="4.0", choices=["4.0", "4.1", "4.2", "4.3"])
-    parser_header.add_argument("-s", "--scheme", default="cenc", choices=["cenc", "cens", "cbc1", "cbcs"])
-    parser_header.add_argument("--header")
-    parser_header.add_argument("--include-checksum", action="store_true")
-    parser_header.add_argument("-o", "--output")
-    parser_header.set_defaults(func=command_kid_to_playready_header)
-
-    parser_derive = subcommands.add_parser("derive-key", help="Derive a PlayReady content key from a seed and KID.")
-    parser_derive.add_argument("--seed", required=True, help="Seed as a hex string or local file path.")
-    parser_derive.add_argument("--kid", required=True)
-    parser_derive.add_argument("--no-swap", action="store_true")
-    parser_derive.set_defaults(func=command_derive_playready_key)
-
-    parser_init = subcommands.add_parser("extract-init", help="Extract Widevine or PlayReady PSSH data from an initialization MP4.")
-    parser_init.add_argument("input")
-    parser_init.add_argument("--drm", default="playready", choices=["playready", "playready-header", "widevine"])
-    parser_init.add_argument("-o", "--output")
-    parser_init.set_defaults(func=command_extract_init_pssh)
-
-    parser_mp4dump = subcommands.add_parser("extract-init-mp4dump", help="Extract PlayReady PSSH data from an initialization MP4 using mp4dump JSON output.")
-    parser_mp4dump.add_argument("input")
-    parser_mp4dump.add_argument("--mp4dump", required=True)
-    parser_mp4dump.add_argument("-o", "--output")
-    parser_mp4dump.set_defaults(func=command_extract_init_pssh_mp4dump)
     return parser
+
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if getattr(args, "debug", False) else logging.INFO)
+    if getattr(args, "version", False):
+        print(__version__)
+        return 0
     if not getattr(args, "cmd", None):
         parser.print_help()
         return 0
